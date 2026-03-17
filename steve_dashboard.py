@@ -1,7 +1,5 @@
 import os
 import json
-
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -175,19 +173,18 @@ def load_google_sheet(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
             st.error("Google Sheets libraries are not available.")
             return pd.DataFrame()
 
-       google_credentials = os.getenv("GOOGLE_CREDENTIALS")
-if not google_credentials:
-    st.error("GOOGLE_CREDENTIALS is not set.")
-    return pd.DataFrame()
+        google_credentials = os.getenv("GOOGLE_CREDENTIALS")
+        if not google_credentials:
+            st.error("GOOGLE_CREDENTIALS is not set.")
+            return pd.DataFrame()
 
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
 
-creds = Credentials.from_service_account_info(
-    json.loads(google_credentials), scopes=scopes
-)
+        creds = Credentials.from_service_account_info(
+            json.loads(google_credentials), scopes=scopes
         )
         client = gspread.authorize(creds)
         ws = client.open_by_key(sheet_id).worksheet(worksheet_name)
@@ -199,7 +196,7 @@ creds = Credentials.from_service_account_info(
 
         header_row_index = 8  # Row 9 in your sheet
         header = rows[header_row_index]
-        data = rows[header_row_index + 1 :]
+        data = rows[header_row_index + 1:]
 
         seen = {}
         cleaned = []
@@ -436,7 +433,6 @@ def compute_rotation_candidate(
     if "BandStatus" in candidates.columns:
         candidates = candidates[candidates["Ticker"] != "NVDA"]
         if not candidates.empty:
-            # Prefer underweight or balanced names as rotation-out candidates
             status_rank = {
                 "Underweight": 0,
                 "Balanced": 1,
@@ -461,7 +457,6 @@ def compute_rotation_candidate(
     weakest_size = float(weakest.get("PositionSize", 0))
     fresh_tii = float(fresh.get("TII", 0))
 
-    # Simple threshold to avoid noisy rotation ideas
     if weakest_size < 15000 and fresh_tii >= 9:
         return {
             "sell_ticker": weakest["Ticker"],

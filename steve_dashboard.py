@@ -1,3 +1,5 @@
+import json
+
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -172,17 +174,19 @@ def load_google_sheet(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
             st.error("Google Sheets libraries are not available.")
             return pd.DataFrame()
 
-        if "gcp_service_account" not in st.secrets:
-            st.error("Streamlit cannot find gcp_service_account in secrets.toml.")
-            return pd.DataFrame()
+       google_credentials = os.getenv("GOOGLE_CREDENTIALS")
+if not google_credentials:
+    st.error("GOOGLE_CREDENTIALS is not set.")
+    return pd.DataFrame()
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=scopes
+creds = Credentials.from_service_account_info(
+    json.loads(google_credentials), scopes=scopes
+)
         )
         client = gspread.authorize(creds)
         ws = client.open_by_key(sheet_id).worksheet(worksheet_name)

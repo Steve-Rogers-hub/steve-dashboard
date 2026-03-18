@@ -65,7 +65,7 @@ def load_sheet_data(sheet_id, worksheet_name, header_row_index):
         return pd.DataFrame()
 
     if len(data) <= header_row_index:
-        raise ValueError(f"Not enough rows for header_row_index={header_row_index}")
+        return pd.DataFrame()
 
     headers = data[header_row_index]
     rows = data[header_row_index + 1:]
@@ -118,6 +118,7 @@ def clean_portfolio_dataframe(df):
         "Highest Market Price",
         "Dividend Income",
         "Dividend Franking Credits",
+        "Sold Date",
         "Sold Price",
         "Sale Price",
         "Sold Value",
@@ -154,8 +155,6 @@ def clean_portfolio_dataframe(df):
     for col in df.columns:
         if df[col].dtype == "object":
             df[col] = df[col].fillna("").astype(str).str.strip()
-        else:
-            df[col] = df[col]
 
     return df
 
@@ -187,14 +186,7 @@ def load_scan_data(csv_path):
 
 
 def detect_scan_name_column(df):
-    candidates = [
-        "ticker",
-        "symbol",
-        "stock",
-        "name",
-        "company",
-        "scan_name",
-    ]
+    candidates = ["ticker", "symbol", "stock", "name", "company", "scan_name"]
     lower_map = {c.lower(): c for c in df.columns}
     for c in candidates:
         if c in lower_map:
@@ -203,18 +195,93 @@ def detect_scan_name_column(df):
 
 
 def detect_scan_score_column(df):
-    candidates = [
-        "score",
-        "composite_score",
-        "rank",
-        "rating",
-        "quality_score",
-    ]
+    candidates = ["score", "composite_score", "rank", "rating", "quality_score", "PriceScore"]
+    exact_map = {c: c for c in df.columns}
     lower_map = {c.lower(): c for c in df.columns}
+
     for c in candidates:
-        if c in lower_map:
-            return lower_map[c]
+        if c in exact_map:
+            return exact_map[c]
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
     return None
+
+
+# =========================
+# DECISION ENGINE
+# =========================
+
+def classify_market_regime(vix, oil, us10y, breadth, hy_oas):
+    risk_score = 0
+
+    if vix >= 30:
+        risk_score += 2
+    elif vix >= 22:
+        risk_score += 1
+
+    if oil >= 95:
+        risk_score += 1
+
+    if us10y >= 4.75:
+        risk_score += 1
+
+    if breadth <= 50:
+        risk_score += 2
+    elif breadth <= 60:
+        risk_score += 1
+
+    if hy_oas >= 5.0:
+        risk_score += 2
+    elif hy_oas >= 4.0:
+        risk_score += 1
+
+    if risk_score >= 6:
+        return "Risk-Off"
+    if risk_score >= 3:
+        return "Cautious"
+    return "Constructive"
+
+
+def decide_action(regime, portfolio_value, open_positions, qualified_scan_names, satellite_target, nvda_multiplier):
+    if regime == "Risk-Off":
+        return {
+            "primary_call": "Defend / reduce risk",
+            "confidence": "High",
+            "action_bias": "Trim weaker names, avoid fresh adds, preserve cash.",
+        }
+
+    if regime == "Cautious":
+        if qualified_scan_names >= 20:
+            return {
+                "primary_call": "Watch / possible add",
+                "confidence": "Medium",
+                "action_bias": "Selective adds only, favor stronger setups and smaller sizing.",
+            }
+        return {
+            "primary_call": "Hold / wait",
+            "confidence": "Medium",
+            "action_bias": "Protect current positions and wait for stronger confirmation.",
+        }
+
+    if portfolio_value < satellite_target:
+        return {
+            "primary_call": "Build selectively",
+            "confidence": "Medium",
+            "action_bias": "Add gradually toward target size, keep NVDA dominant.",
+        }
+
+    if open_positions >= 12:
+        return {
+            "primary_call": "Hold / optimize",
+            "confidence": "Medium",
+            "action_bias": "Portfolio already well populated; improve quality rather than adding broadly.",
+        }
+
+    return {
+        "primary_call": "Watch / possible add",
+        "confidence": "Medium",
+        "action_bias": f"Selective adds acceptable; keep NVDA weighting discipline near {nvda_multiplier:.2f}x.",
+    }
 
 
 # =========================
@@ -226,7 +293,27 @@ st.set_page_config(page_title="Steve Dashboard", layout="wide")
 st.title("Steve Dashboard")
 st.caption("Live portfolio data from Google Sheets plus Wall Street scan output")
 
-# Load portfolio
+# =========================
+# SIDEBAR
+# =========================
+
+st.sidebar.header("Market Sentiment Inputs")
+
+vix = st.sidebar.number_input("VIX", min_value=0.0, value=22.0, step=0.1)
+oil = st.sidebar.number_input("Oil (WTI)", min_value=0.0, value=72.0, step=0.1)
+us10y = st.sidebar.number_input("US 10Y Yield (%)", min_value=0.0, value=4.30, step=0.01)
+breadth = st.sidebar.number_input("Breadth (% above key trend)", min_value=0.0, max_value=100.0, value=58.0, step=1.0)
+hy_oas = st.sidebar.number_input("HY OAS (%)", min_value=0.0, value=3.8, step=0.1)
+
+st.sidebar.header("Portfolio Rules")
+
+satellite_target = st.sidebar.number_input("Satellite target ($)", min_value=0.0, value=40000.0, step=1000.0)
+nvda_multiplier = st.sidebar.number_input("NVDA dominance multiplier", min_value=0.1, value=1.75, step=0.05)
+
+# =========================
+# LOAD DATA
+# =========================
+
 try:
     df_portfolio = load_sheet_data(SHEET_ID, WORKSHEET_NAME, HEADER_ROW_INDEX)
     df_portfolio = clean_portfolio_dataframe(df_portfolio)
@@ -234,8 +321,62 @@ except Exception as e:
     st.error(f"Could not load worksheet '{WORKSHEET_NAME}': {e}")
     df_portfolio = pd.DataFrame()
 
-# Load scan
 df_scan = load_scan_data(SCAN_CSV_PATH)
+
+# =========================
+# PORTFOLIO METRICS
+# =========================
+
+portfolio_value = 0.0
+open_positions = 0
+net_profit = 0.0
+
+if not df_portfolio.empty:
+    if "Market Value" in df_portfolio.columns:
+        portfolio_value = df_portfolio["Market Value"].fillna(0).sum()
+
+    if "Position Status" in df_portfolio.columns:
+        open_positions = (
+            df_portfolio["Position Status"]
+            .astype(str)
+            .str.lower()
+            .eq("open")
+            .sum()
+        )
+
+    if "Net Profit/Loss" in df_portfolio.columns:
+        net_profit = df_portfolio["Net Profit/Loss"].fillna(0).sum()
+
+qualified_scan_names = len(df_scan) if not df_scan.empty else 0
+
+market_regime = classify_market_regime(vix, oil, us10y, breadth, hy_oas)
+decision = decide_action(
+    regime=market_regime,
+    portfolio_value=portfolio_value,
+    open_positions=open_positions,
+    qualified_scan_names=qualified_scan_names,
+    satellite_target=satellite_target,
+    nvda_multiplier=nvda_multiplier,
+)
+
+# =========================
+# TOP AI RECOMMENDATION BLOCK
+# =========================
+
+st.header("AI Recommendation")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Portfolio value", f"${portfolio_value:,.2f}")
+m2.metric("Qualified scan names", f"{qualified_scan_names:,}")
+m3.metric("This week's action", decision["primary_call"])
+m4.metric("Market regime", market_regime)
+
+st.info(
+    f"**Primary call:** {decision['primary_call']}\n\n"
+    f"**Market regime:** {market_regime}\n\n"
+    f"**Confidence:** {decision['confidence']}\n\n"
+    f"**Action bias:** {decision['action_bias']}"
+)
 
 # =========================
 # PORTFOLIO SECTION
@@ -247,24 +388,6 @@ if df_portfolio.empty:
     st.warning("Portfolio sheet loaded no usable rows.")
 else:
     st.write(f"Rows loaded: {len(df_portfolio)}")
-
-    portfolio_value = 0.0
-    if "Market Value" in df_portfolio.columns:
-        portfolio_value = df_portfolio["Market Value"].fillna(0).sum()
-
-    open_positions = 0
-    if "Position Status" in df_portfolio.columns:
-        open_positions = (
-            df_portfolio["Position Status"]
-            .astype(str)
-            .str.lower()
-            .eq("open")
-            .sum()
-        )
-
-    net_profit = 0.0
-    if "Net Profit/Loss" in df_portfolio.columns:
-        net_profit = df_portfolio["Net Profit/Loss"].fillna(0).sum()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Portfolio Value", f"${portfolio_value:,.2f}")
@@ -317,13 +440,13 @@ else:
         else:
             st.metric("Top Names", "N/A")
 
-    if score_col and score_col in df_scan.columns:
+    if score_col and name_col and score_col in df_scan.columns:
         try:
             scan_chart = df_scan[[name_col, score_col]].copy()
             scan_chart[score_col] = pd.to_numeric(scan_chart[score_col], errors="coerce")
             scan_chart = scan_chart.dropna(subset=[score_col]).head(15)
 
-            if not scan_chart.empty and name_col:
+            if not scan_chart.empty:
                 st.subheader("Top Scan Scores")
                 st.bar_chart(scan_chart.set_index(name_col)[score_col])
         except Exception:
@@ -333,7 +456,7 @@ else:
     st.dataframe(df_scan, use_container_width=True, hide_index=True)
 
 # =========================
-# DEBUG SECTION
+# DEBUG
 # =========================
 
 with st.expander("Detected Portfolio Columns"):

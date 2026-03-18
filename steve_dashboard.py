@@ -13,6 +13,7 @@ SHEET_ID = "1CL5Rs7eMU4M0K5pgrKYVb7tUhJVuXn8fDIax9L0_31k"
 WORKSHEET_NAME = "US Trades - USD"
 HEADER_ROW_INDEX = 8
 SCAN_CSV_PATH = "weekly_scan_output.csv"
+TOP_SCAN_LIMIT = 100
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -195,16 +196,34 @@ def detect_scan_name_column(df):
 
 
 def detect_scan_score_column(df):
-    candidates = ["score", "composite_score", "rank", "rating", "quality_score", "PriceScore"]
-    exact_map = {c: c for c in df.columns}
+    candidates = [
+        "composite_score",
+        "score",
+        "rank",
+        "rating",
+        "quality_score",
+        "pricescore",
+    ]
     lower_map = {c.lower(): c for c in df.columns}
-
     for c in candidates:
-        if c in exact_map:
-            return exact_map[c]
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
+        if c in lower_map:
+            return lower_map[c]
     return None
+
+
+def prepare_top_scan_table(df, top_n=100):
+    if df.empty:
+        return df
+
+    df = df.copy()
+    name_col = detect_scan_name_column(df)
+    score_col = detect_scan_score_column(df)
+
+    if score_col and score_col in df.columns:
+        df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+        df = df.sort_values(by=score_col, ascending=False, na_position="last")
+
+    return df.head(top_n)
 
 
 # =========================
@@ -236,51 +255,88 @@ def classify_market_regime(vix, oil, us10y, breadth, hy_oas):
         risk_score += 1
 
     if risk_score >= 6:
-        return "Risk-Off"
+        return "Risk-Off", risk_score
     if risk_score >= 3:
-        return "Cautious"
-    return "Constructive"
+        return "Cautious", risk_score
+    return "Constructive", risk_score
 
 
-def decide_action(regime, portfolio_value, open_positions, qualified_scan_names, satellite_target, nvda_multiplier):
+def build_ai_recommendation(
+    regime,
+    risk_score,
+    portfolio_value,
+    open_positions,
+    net_profit,
+    qualified_scan_names,
+    top_names,
+    satellite_target,
+    nvda_multiplier,
+):
+    confidence = "Medium"
+    call = "Watch / possible add"
+    action_bias = "Selective adds acceptable."
+    portfolio_posture = "Balanced"
+    scan_reading = "Normal opportunity set."
+    risk_note = "No major stress signal."
+    sizing_note = f"Use gradual adds and keep NVDA dominance near {nvda_multiplier:.2f}x."
+    next_step = "Review top-ranked scans before acting."
+
     if regime == "Risk-Off":
-        return {
-            "primary_call": "Defend / reduce risk",
-            "confidence": "High",
-            "action_bias": "Trim weaker names, avoid fresh adds, preserve cash.",
-        }
+        confidence = "High"
+        call = "Defend / reduce risk"
+        action_bias = "Reduce weaker exposure, avoid broad new buying, preserve flexibility."
+        portfolio_posture = "Defensive"
+        scan_reading = "Scan opportunities are less important than protecting capital."
+        risk_note = "Multiple macro stress indicators are elevated."
+        sizing_note = "Only consider exceptional setups; default to smaller or no adds."
+        next_step = "Review weakest open holdings and tighten risk controls."
 
-    if regime == "Cautious":
-        if qualified_scan_names >= 20:
-            return {
-                "primary_call": "Watch / possible add",
-                "confidence": "Medium",
-                "action_bias": "Selective adds only, favor stronger setups and smaller sizing.",
-            }
-        return {
-            "primary_call": "Hold / wait",
-            "confidence": "Medium",
-            "action_bias": "Protect current positions and wait for stronger confirmation.",
-        }
+    elif regime == "Cautious":
+        confidence = "Medium"
+        call = "Hold / selective add"
+        action_bias = "Favor only strongest setups and keep adds measured."
+        portfolio_posture = "Guarded"
+        scan_reading = "There are opportunities, but quality matters more than quantity."
+        risk_note = "Market conditions are mixed and deserve caution."
+        sizing_note = "Smaller position sizes are appropriate."
+        next_step = "Focus on top-ranked names and avoid lower-conviction entries."
 
-    if portfolio_value < satellite_target:
-        return {
-            "primary_call": "Build selectively",
-            "confidence": "Medium",
-            "action_bias": "Add gradually toward target size, keep NVDA dominant.",
-        }
+    elif regime == "Constructive":
+        confidence = "Medium"
+        portfolio_posture = "Constructive"
+        scan_reading = "Backdrop supports selective offense."
+        risk_note = "Macro stress appears contained."
 
-    if open_positions >= 12:
-        return {
-            "primary_call": "Hold / optimize",
-            "confidence": "Medium",
-            "action_bias": "Portfolio already well populated; improve quality rather than adding broadly.",
-        }
+        if portfolio_value < satellite_target:
+            call = "Build selectively"
+            action_bias = "Add gradually toward target size while keeping quality high."
+            next_step = "Use the scan list to identify the highest-quality incremental adds."
+        elif open_positions >= 12:
+            call = "Hold / optimize"
+            action_bias = "Improve quality rather than expanding the portfolio too broadly."
+            next_step = "Compare top scan names against weaker current holdings."
+        else:
+            call = "Watch / possible add"
+            action_bias = "Selective new adds are acceptable."
+            next_step = "Review the strongest few scan candidates for timing."
+
+    profit_state = "Profitable" if net_profit >= 0 else "Underwater"
+    top_names_text = ", ".join(top_names) if top_names else "N/A"
 
     return {
-        "primary_call": "Watch / possible add",
-        "confidence": "Medium",
-        "action_bias": f"Selective adds acceptable; keep NVDA weighting discipline near {nvda_multiplier:.2f}x.",
+        "primary_call": call,
+        "confidence": confidence,
+        "market_regime": regime,
+        "risk_score": risk_score,
+        "action_bias": action_bias,
+        "portfolio_posture": portfolio_posture,
+        "scan_reading": scan_reading,
+        "risk_note": risk_note,
+        "sizing_note": sizing_note,
+        "next_step": next_step,
+        "profit_state": profit_state,
+        "top_names_text": top_names_text,
+        "qualified_scan_names": qualified_scan_names,
     }
 
 
@@ -322,6 +378,7 @@ except Exception as e:
     df_portfolio = pd.DataFrame()
 
 df_scan = load_scan_data(SCAN_CSV_PATH)
+df_scan_top = prepare_top_scan_table(df_scan, TOP_SCAN_LIMIT)
 
 # =========================
 # PORTFOLIO METRICS
@@ -347,14 +404,22 @@ if not df_portfolio.empty:
     if "Net Profit/Loss" in df_portfolio.columns:
         net_profit = df_portfolio["Net Profit/Loss"].fillna(0).sum()
 
-qualified_scan_names = len(df_scan) if not df_scan.empty else 0
+qualified_scan_names = len(df_scan_top) if not df_scan_top.empty else 0
+scan_name_col = detect_scan_name_column(df_scan_top)
+top_names = []
+if scan_name_col and not df_scan_top.empty:
+    top_names = df_scan_top[scan_name_col].astype(str).head(3).tolist()
 
-market_regime = classify_market_regime(vix, oil, us10y, breadth, hy_oas)
-decision = decide_action(
+market_regime, risk_score = classify_market_regime(vix, oil, us10y, breadth, hy_oas)
+
+decision = build_ai_recommendation(
     regime=market_regime,
+    risk_score=risk_score,
     portfolio_value=portfolio_value,
     open_positions=open_positions,
+    net_profit=net_profit,
     qualified_scan_names=qualified_scan_names,
+    top_names=top_names,
     satellite_target=satellite_target,
     nvda_multiplier=nvda_multiplier,
 )
@@ -369,13 +434,19 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Portfolio value", f"${portfolio_value:,.2f}")
 m2.metric("Qualified scan names", f"{qualified_scan_names:,}")
 m3.metric("This week's action", decision["primary_call"])
-m4.metric("Market regime", market_regime)
+m4.metric("Market regime", decision["market_regime"])
 
 st.info(
     f"**Primary call:** {decision['primary_call']}\n\n"
-    f"**Market regime:** {market_regime}\n\n"
     f"**Confidence:** {decision['confidence']}\n\n"
-    f"**Action bias:** {decision['action_bias']}"
+    f"**Portfolio posture:** {decision['portfolio_posture']}\n\n"
+    f"**Action bias:** {decision['action_bias']}\n\n"
+    f"**Risk note:** {decision['risk_note']}\n\n"
+    f"**Scan reading:** {decision['scan_reading']}\n\n"
+    f"**Sizing note:** {decision['sizing_note']}\n\n"
+    f"**Current profit state:** {decision['profit_state']}\n\n"
+    f"**Top scan names:** {decision['top_names_text']}\n\n"
+    f"**Next step:** {decision['next_step']}"
 )
 
 # =========================
@@ -420,40 +491,35 @@ else:
 
 st.header("Wall Street Scan")
 
-if df_scan.empty:
+if df_scan_top.empty:
     st.warning("weekly_scan_output.csv not found or empty.")
 else:
-    st.write(f"Scan rows loaded: {len(df_scan)}")
+    st.write(f"Showing top {len(df_scan_top)} scan rows")
 
-    name_col = detect_scan_name_column(df_scan)
-    score_col = detect_scan_score_column(df_scan)
+    score_col = detect_scan_score_column(df_scan_top)
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.metric("Qualified Scan Names", f"{len(df_scan):,}")
+        st.metric("Qualified Scan Names", f"{len(df_scan_top):,}")
 
     with col2:
-        if name_col and len(df_scan) > 0:
-            top_names = ", ".join(df_scan[name_col].astype(str).head(3).tolist())
-            st.metric("Top Names", top_names if top_names else "N/A")
-        else:
-            st.metric("Top Names", "N/A")
+        st.metric("Top Names", decision["top_names_text"])
 
-    if score_col and name_col and score_col in df_scan.columns:
+    if score_col and scan_name_col and score_col in df_scan_top.columns:
         try:
-            scan_chart = df_scan[[name_col, score_col]].copy()
+            scan_chart = df_scan_top[[scan_name_col, score_col]].copy()
             scan_chart[score_col] = pd.to_numeric(scan_chart[score_col], errors="coerce")
             scan_chart = scan_chart.dropna(subset=[score_col]).head(15)
 
             if not scan_chart.empty:
                 st.subheader("Top Scan Scores")
-                st.bar_chart(scan_chart.set_index(name_col)[score_col])
+                st.bar_chart(scan_chart.set_index(scan_name_col)[score_col])
         except Exception:
             pass
 
     st.subheader("Wall Street Scan Table")
-    st.dataframe(df_scan, use_container_width=True, hide_index=True)
+    st.dataframe(df_scan_top, use_container_width=True, hide_index=True)
 
 # =========================
 # DEBUG

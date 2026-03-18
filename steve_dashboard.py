@@ -45,65 +45,47 @@ def get_gspread_client():
 
 
 @st.cache_data(ttl=300)
-def load_sheet_data(sheet_id: str, worksheet_name: str, header_row_index: int) -> pd.DataFrame:
+def load_sheet_data(sheet_id, worksheet_name, header_row_index):
     client = get_gspread_client()
     sheet = client.open_by_key(sheet_id)
     worksheet = sheet.worksheet(worksheet_name)
 
     data = worksheet.get_all_values()
 
-    if not data:
-        return pd.DataFrame()
-
-    if len(data) <= header_row_index:
-        raise ValueError(f"Not enough rows for header_row_index={header_row_index}")
-
     headers = data[header_row_index]
     rows = data[header_row_index + 1:]
 
+    # Clean headers
     clean_headers = []
     seen = {}
 
     for i, h in enumerate(headers):
-        col_name = h.strip() if h else f"Column_{i+1}"
-        if col_name in seen:
-            seen[col_name] += 1
-            col_name = f"{col_name}_{seen[col_name]}"
+        col = h.strip() if h else f"Column_{i+1}"
+        if col in seen:
+            seen[col] += 1
+            col = f"{col}_{seen[col]}"
         else:
-            seen[col_name] = 1
-        clean_headers.append(col_name)
+            seen[col] = 1
+        clean_headers.append(col)
 
     df = pd.DataFrame(rows, columns=clean_headers)
 
-    # Remove fully empty rows and columns
+    # Clean data
     df = df.replace("", pd.NA)
     df = df.dropna(how="all")
     df = df.dropna(axis=1, how="all")
-    df = df.fillna("")
 
     return df
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = df.copy()
-    df.columns = [str(col).strip() for col in df.columns]
-
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].astype(str).str.strip()
-
-    return df
-
-
-def convert_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
+def clean_and_format(df):
     df = df.copy()
 
+    # Remove spreadsheet errors
+    df = df.replace("#REF!", pd.NA)
+    df = df.replace("#VALUE!", pd.NA)
+
+    # Numeric cleanup
     numeric_cols = [
         "Quantity",
         "Purchase Price",
@@ -112,139 +94,60 @@ def convert_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Total Purchase Costs",
         "Latest Market Price",
         "Market Value",
-        "Stop/Sell Price",
-        "Gross Profit/Loss",
         "Net Profit/Loss",
-        "% Gain/Loss",
-        "Previous Day Close Price",
-        "Previous Day Market Value",
-        "Highest Market Price",
-        "Dividend Income",
-        "Dividend Franking Credits",
-        "Sold Price",
-        "Total Return",
-        "Trade Brokerage",
-        "Total Sale Proceeds",
-        "Gross Realised Profit/Loss",
-        "Net Realised Profit/Loss",
     ]
 
     for col in numeric_cols:
         if col in df.columns:
-            cleaned = (
+            df[col] = (
                 df[col]
                 .astype(str)
-                .str.replace("$", "", regex=False)
-                .str.replace(",", "", regex=False)
-                .str.replace("%", "", regex=False)
-                .str.replace("(", "-", regex=False)
-                .str.replace(")", "", regex=False)
+                .str.replace("$", "")
+                .str.replace(",", "")
                 .str.strip()
             )
-            df[col] = pd.to_numeric(cleaned, errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Date formatting
+    if "Trade Date" in df.columns:
+        df["Trade Date"] = pd.to_datetime(df["Trade Date"], errors="coerce")
+        df["Trade Date"] = df["Trade Date"].dt.strftime("%d-%b-%Y")
 
     return df
 
 
-def convert_date_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = df.copy()
-
-    date_cols = [
-        "Trade Date",
-        "Sold Date",
-    ]
-
-    for col in date_cols:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-
-    return df
-
+# ---------------- UI ----------------
 
 st.set_page_config(page_title="Steve Dashboard", layout="wide")
 
 st.title("Steve Dashboard")
 st.caption("Live data from Google Sheets")
 
-try:
-    df_us = load_sheet_data(
-        sheet_id=SHEET_ID,
-        worksheet_name=WORKSHEET_NAME,
-        header_row_index=HEADER_ROW_INDEX,
-    )
-    df_us = clean_dataframe(df_us)
-    df_us = convert_numeric_columns(df_us)
-    df_us = convert_date_columns(df_us)
-except Exception as e:
-    st.error(f"Could not load worksheet '{WORKSHEET_NAME}': {e}")
-    st.stop()
-
-if df_us.empty:
-    st.warning("The worksheet loaded successfully, but no data rows were found.")
-    st.stop()
+df = load_sheet_data(SHEET_ID, WORKSHEET_NAME, HEADER_ROW_INDEX)
+df = clean_and_format(df)
 
 st.subheader("US Trades - USD")
-st.write(f"Rows loaded: {len(df_us)}")
-st.dataframe(df_us, use_container_width=True, hide_index=True)
+st.write(f"Rows loaded: {len(df)}")
+
+st.dataframe(df, use_container_width=True)
+
+# -------- Summary --------
 
 st.subheader("Quick Summary")
 
-total_rows = len(df_us)
-total_columns = len(df_us.columns)
+portfolio_value = df["Market Value"].sum() if "Market Value" in df.columns else 0
+open_positions = (
+    (df["Position Status"].str.lower() == "open").sum()
+    if "Position Status" in df.columns
+    else 0
+)
 
-open_holdings = 0
-if "Position Status" in df_us.columns:
-    open_holdings = (df_us["Position Status"].astype(str).str.lower() == "open").sum()
+col1, col2 = st.columns(2)
 
-portfolio_value = 0.0
-if "Market Value" in df_us.columns:
-    portfolio_value = df_us["Market Value"].fillna(0).sum()
+col1.metric("Portfolio Value", f"${portfolio_value:,.2f}")
+col2.metric("Open Positions", open_positions)
 
-net_profit_loss = 0.0
-if "Net Profit/Loss" in df_us.columns:
-    net_profit_loss = df_us["Net Profit/Loss"].fillna(0).sum()
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric("Total Rows", f"{total_rows:,}")
-
-with col2:
-    st.metric("Total Columns", f"{total_columns:,}")
-
-with col3:
-    st.metric("Open Holdings", f"{open_holdings:,}")
-
-with col4:
-    st.metric("Portfolio Value", f"${portfolio_value:,.2f}")
-
-st.subheader("Profit Summary")
-st.metric("Net Profit/Loss", f"${net_profit_loss:,.2f}")
-
-st.subheader("Selected Columns")
-
-preferred_cols = [
-    "Trade Date",
-    "Stock",
-    "Company Name",
-    "Position Status",
-    "Quantity",
-    "Purchase Price",
-    "Latest Market Price",
-    "Market Value",
-    "Net Profit/Loss",
-    "% Gain/Loss",
-]
-
-available_cols = [col for col in preferred_cols if col in df_us.columns]
-
-if available_cols:
-    st.dataframe(df_us[available_cols], use_container_width=True, hide_index=True)
-else:
-    st.info("None of the preferred columns were found exactly as named in the worksheet.")
+# -------- Debug --------
 
 st.subheader("Detected Columns")
-st.write(df_us.columns.tolist())
+st.write(df.columns.tolist())

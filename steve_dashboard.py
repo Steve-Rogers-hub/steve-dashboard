@@ -74,7 +74,12 @@ def load_sheet_data(sheet_id: str, worksheet_name: str, header_row_index: int) -
         clean_headers.append(col_name)
 
     df = pd.DataFrame(rows, columns=clean_headers)
-    df = df.replace("", pd.NA).dropna(how="all").fillna("")
+
+    # Remove fully empty rows and columns
+    df = df.replace("", pd.NA)
+    df = df.dropna(how="all")
+    df = df.dropna(axis=1, how="all")
+    df = df.fillna("")
 
     return df
 
@@ -93,6 +98,72 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def convert_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    numeric_cols = [
+        "Quantity",
+        "Purchase Price",
+        "Buy Cost",
+        "Buy Brokerage",
+        "Total Purchase Costs",
+        "Latest Market Price",
+        "Market Value",
+        "Stop/Sell Price",
+        "Gross Profit/Loss",
+        "Net Profit/Loss",
+        "% Gain/Loss",
+        "Previous Day Close Price",
+        "Previous Day Market Value",
+        "Highest Market Price",
+        "Dividend Income",
+        "Dividend Franking Credits",
+        "Sold Price",
+        "Total Return",
+        "Trade Brokerage",
+        "Total Sale Proceeds",
+        "Gross Realised Profit/Loss",
+        "Net Realised Profit/Loss",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            cleaned = (
+                df[col]
+                .astype(str)
+                .str.replace("$", "", regex=False)
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.replace("(", "-", regex=False)
+                .str.replace(")", "", regex=False)
+                .str.strip()
+            )
+            df[col] = pd.to_numeric(cleaned, errors="coerce")
+
+    return df
+
+
+def convert_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    date_cols = [
+        "Trade Date",
+        "Sold Date",
+    ]
+
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+    return df
+
+
 st.set_page_config(page_title="Steve Dashboard", layout="wide")
 
 st.title("Steve Dashboard")
@@ -105,6 +176,8 @@ try:
         header_row_index=HEADER_ROW_INDEX,
     )
     df_us = clean_dataframe(df_us)
+    df_us = convert_numeric_columns(df_us)
+    df_us = convert_date_columns(df_us)
 except Exception as e:
     st.error(f"Could not load worksheet '{WORKSHEET_NAME}': {e}")
     st.stop()
@@ -119,25 +192,51 @@ st.dataframe(df_us, use_container_width=True, hide_index=True)
 
 st.subheader("Quick Summary")
 
-col1, col2 = st.columns(2)
+total_rows = len(df_us)
+total_columns = len(df_us.columns)
+
+open_holdings = 0
+if "Position Status" in df_us.columns:
+    open_holdings = (df_us["Position Status"].astype(str).str.lower() == "open").sum()
+
+portfolio_value = 0.0
+if "Market Value" in df_us.columns:
+    portfolio_value = df_us["Market Value"].fillna(0).sum()
+
+net_profit_loss = 0.0
+if "Net Profit/Loss" in df_us.columns:
+    net_profit_loss = df_us["Net Profit/Loss"].fillna(0).sum()
+
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("Total Rows", len(df_us))
-    st.metric("Total Columns", len(df_us.columns))
+    st.metric("Total Rows", f"{total_rows:,}")
 
 with col2:
-    st.write("Detected columns:")
-    st.write(df_us.columns.tolist())
+    st.metric("Total Columns", f"{total_columns:,}")
+
+with col3:
+    st.metric("Open Holdings", f"{open_holdings:,}")
+
+with col4:
+    st.metric("Portfolio Value", f"${portfolio_value:,.2f}")
+
+st.subheader("Profit Summary")
+st.metric("Net Profit/Loss", f"${net_profit_loss:,.2f}")
 
 st.subheader("Selected Columns")
 
 preferred_cols = [
     "Trade Date",
     "Stock",
-    "Buy/Sell",
-    "Units",
-    "Price",
-    "Brokerage",
+    "Company Name",
+    "Position Status",
+    "Quantity",
+    "Purchase Price",
+    "Latest Market Price",
+    "Market Value",
+    "Net Profit/Loss",
+    "% Gain/Loss",
 ]
 
 available_cols = [col for col in preferred_cols if col in df_us.columns]
@@ -146,3 +245,6 @@ if available_cols:
     st.dataframe(df_us[available_cols], use_container_width=True, hide_index=True)
 else:
     st.info("None of the preferred columns were found exactly as named in the worksheet.")
+
+st.subheader("Detected Columns")
+st.write(df_us.columns.tolist())

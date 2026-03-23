@@ -792,64 +792,50 @@ def compute_tii_scores(df, macro_regime="Neutral"):
     x["score_momentum_adj"] = x["score_momentum"] * overlay["momentum"]
 
     # -------------------------
-# ----------------------------
-# Final TII score (factor model)
-# ----------------------------
-x["tii_score"] = (
-    x["score_quality_adj"] * 0.28 +
-    x["score_growth_adj"] * 0.26 +
-    x["score_momentum_adj"] * 0.22 +
-    x["score_balance_sheet_adj"] * 0.14 +
-    x["score_value_adj"] * 0.10
-)
+def compute_tii_scores(df, macro_regime="Neutral"):
+    x = df.copy()
 
-# ----------------------------
-# Penalties for weak fundamentals
-# ----------------------------
-penalty = np.zeros(len(x), dtype=float)
+    # ----------------------------
+    # Final TII score (factor model)
+    # ----------------------------
+    x["tii_score"] = (
+        x["score_quality_adj"] * 0.28 +
+        x["score_growth_adj"] * 0.26 +
+        x["score_momentum_adj"] * 0.22 +
+        x["score_balance_sheet_adj"] * 0.14 +
+        x["score_value_adj"] * 0.10
+    )
 
-penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0)
-penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0)
-penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0)
-penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0)
+    penalty = np.zeros(len(x), dtype=float)
 
-x["tii_score"] = x["tii_score"] - penalty
+    penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0)
+    penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0)
+    penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0)
+    penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0)
 
-# ----------------------------
-# Clean ranking
-# ----------------------------
-x["tii_score"] = pd.to_numeric(x["tii_score"], errors="coerce").round(2)
+    x["tii_score"] = x["tii_score"] - penalty
 
-# ----------------------------
-# Data confidence calculation
-# ----------------------------
-available = x[completeness_cols].notna().sum(axis=1)
-x["data_confidence"] = ((available / len(completeness_cols)) * 100).round(0)
+    x["tii_score"] = pd.to_numeric(x["tii_score"], errors="coerce").round(2)
 
-# ----------------------------
-# Fallback when fundamentals are missing
-# ----------------------------
-fallback_mask = x["data_confidence"] < 35
+    available = x[completeness_cols].notna().sum(axis=1)
+    x["data_confidence"] = ((available / len(completeness_cols)) * 100).round(0)
 
-fallback_score = (
-    rank_pct(x["return_1m"], ascending=False) * 0.15 +
-    rank_pct(x["return_3m"], ascending=False) * 0.30 +
-    rank_pct(x["return_6m"], ascending=False) * 0.30 +
-    rank_pct(x["return_12m"], ascending=False) * 0.25
-)
+    fallback_mask = x["data_confidence"] < 35
 
-# modest volatility penalty
-fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
+    fallback_score = (
+        rank_pct(x["return_1m"], ascending=False) * 0.15 +
+        rank_pct(x["return_3m"], ascending=False) * 0.30 +
+        rank_pct(x["return_6m"], ascending=False) * 0.30 +
+        rank_pct(x["return_12m"], ascending=False) * 0.25
+    )
 
-x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
+    fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
 
-# Track source of score
-x["score_source"] = np.where(fallback_mask, "Price fallback", "Full factor model")
+    x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
 
-# ----------------------------
-# Final sort + return
-# ----------------------------
-return x.sort_values("tii_score", ascending=False).reset_index(drop=True)
+    x["score_source"] = np.where(fallback_mask, "Price fallback", "Full factor model")
+
+    return x.sort_values("tii_score", ascending=False).reset_index(drop=True)
 
 # Fallback when fundamental coverage is too sparse:
 # use price-based scoring so the dashboard still works.

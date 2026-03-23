@@ -700,12 +700,8 @@ def build_macro_overlay(macro_regime="Neutral"):
 
 def compute_tii_scores(df, macro_regime="Neutral"):
     """
-    Corrected TII engine:
-    - harmonises columns
-    - clips outliers
-    - scores each factor robustly
-    - applies macro overlay
-    - creates a final TII score and rank
+    Robust TII scoring engine used by the dashboard.
+    Returns the full scored universe sorted by descending TII score.
     """
     x = standardise_factor_columns(df).copy()
 
@@ -713,131 +709,124 @@ def compute_tii_scores(df, macro_regime="Neutral"):
     x["sector"] = x["sector"].replace("", np.nan).fillna("Unknown")
     x["industry"] = x["industry"].replace("", np.nan).fillna("Unknown")
 
-    # Outlier control
     numeric_cols = [
         "market_cap", "price", "pe", "ps", "ev_ebit", "fcf_yield",
         "revenue_growth", "eps_growth", "fcf_growth",
         "gross_margin", "operating_margin", "net_margin", "roic", "roe",
         "debt_to_equity", "net_debt_ebitda", "current_ratio",
-        "return_1m", "return_3m", "return_6m", "return_12m", "volatility"
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
     ]
+
+    # Winsorise inputs to limit outlier distortion
     for col in numeric_cols:
         if col in x.columns:
             x[col] = clip_series(x[col])
 
-    # Better missing-data handling
-    for col in [
+    # Fill missing factor inputs sector-first, then global median
+    factor_input_cols = [
         "pe", "ps", "ev_ebit", "fcf_yield",
         "revenue_growth", "eps_growth", "fcf_growth",
         "gross_margin", "operating_margin", "net_margin", "roic", "roe",
         "debt_to_equity", "net_debt_ebitda", "current_ratio",
-        "return_1m", "return_3m", "return_6m", "return_12m", "volatility"
-    ]:
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
+    ]
+    for col in factor_input_cols:
         x[col] = fill_missing_with_median_by_group(x, col, "sector")
 
-    # -------------------------
     # Raw sub-factor scores
-    # -------------------------
-
-    # Value: lower multiples better, higher FCF yield better
     x["score_value"] = (
-        rank_pct(x["pe"], ascending=True) * 0.25 +
-        rank_pct(x["ps"], ascending=True) * 0.20 +
-        rank_pct(x["ev_ebit"], ascending=True) * 0.25 +
-        rank_pct(x["fcf_yield"], ascending=False) * 0.30
+        rank_pct(x["pe"], ascending=True) * 0.25
+        + rank_pct(x["ps"], ascending=True) * 0.20
+        + rank_pct(x["ev_ebit"], ascending=True) * 0.25
+        + rank_pct(x["fcf_yield"], ascending=False) * 0.30
     )
 
-    # Growth: higher is better
     x["score_growth"] = (
-        rank_pct(x["revenue_growth"], ascending=False) * 0.40 +
-        rank_pct(x["eps_growth"], ascending=False) * 0.35 +
-        rank_pct(x["fcf_growth"], ascending=False) * 0.25
+        rank_pct(x["revenue_growth"], ascending=False) * 0.40
+        + rank_pct(x["eps_growth"], ascending=False) * 0.35
+        + rank_pct(x["fcf_growth"], ascending=False) * 0.25
     )
 
-    # Quality: higher margins and returns better
     x["score_quality"] = (
-        rank_pct(x["gross_margin"], ascending=False) * 0.15 +
-        rank_pct(x["operating_margin"], ascending=False) * 0.25 +
-        rank_pct(x["net_margin"], ascending=False) * 0.15 +
-        rank_pct(x["roic"], ascending=False) * 0.25 +
-        rank_pct(x["roe"], ascending=False) * 0.20
+        rank_pct(x["gross_margin"], ascending=False) * 0.15
+        + rank_pct(x["operating_margin"], ascending=False) * 0.25
+        + rank_pct(x["net_margin"], ascending=False) * 0.15
+        + rank_pct(x["roic"], ascending=False) * 0.25
+        + rank_pct(x["roe"], ascending=False) * 0.20
     )
 
-    # Balance sheet: less leverage and stronger liquidity better
     x["score_balance_sheet"] = (
-        rank_pct(x["debt_to_equity"], ascending=True) * 0.40 +
-        rank_pct(x["net_debt_ebitda"], ascending=True) * 0.35 +
-        rank_pct(x["current_ratio"], ascending=False) * 0.25
+        rank_pct(x["debt_to_equity"], ascending=True) * 0.40
+        + rank_pct(x["net_debt_ebitda"], ascending=True) * 0.35
+        + rank_pct(x["current_ratio"], ascending=False) * 0.25
     )
 
-    # Momentum: medium-term stronger, but penalise excessive volatility
     x["score_momentum_raw"] = (
-        rank_pct(x["return_1m"], ascending=False) * 0.10 +
-        rank_pct(x["return_3m"], ascending=False) * 0.25 +
-        rank_pct(x["return_6m"], ascending=False) * 0.30 +
-        rank_pct(x["return_12m"], ascending=False) * 0.35
+        rank_pct(x["return_1m"], ascending=False) * 0.10
+        + rank_pct(x["return_3m"], ascending=False) * 0.25
+        + rank_pct(x["return_6m"], ascending=False) * 0.30
+        + rank_pct(x["return_12m"], ascending=False) * 0.35
     )
     x["score_low_vol"] = rank_pct(x["volatility"], ascending=True)
     x["score_momentum"] = x["score_momentum_raw"] * 0.85 + x["score_low_vol"] * 0.15
 
-    # -------------------------
     # Macro overlay
-    # -------------------------
     overlay = build_macro_overlay(macro_regime)
-
     x["score_value_adj"] = x["score_value"] * overlay["value"]
     x["score_growth_adj"] = x["score_growth"] * overlay["growth"]
     x["score_quality_adj"] = x["score_quality"] * overlay["quality"]
     x["score_balance_sheet_adj"] = x["score_balance_sheet"] * overlay["balance_sheet"]
     x["score_momentum_adj"] = x["score_momentum"] * overlay["momentum"]
 
-    # -------------------------
-def compute_tii_scores(df, macro_regime="Neutral"):
-    x = df.copy()
-
-    # ----------------------------
-    # ----------------------------
-    # Final TII score (factor model)
-    # ----------------------------
+    # Final TII score
     x["tii_score"] = (
-        x["score_quality_adj"] * 0.28 +
-        x["score_growth_adj"] * 0.26 +
-        x["score_momentum_adj"] * 0.22 +
-        x["score_balance_sheet_adj"] * 0.14 +
-        x["score_value_adj"] * 0.10
+        x["score_quality_adj"] * 0.28
+        + x["score_growth_adj"] * 0.26
+        + x["score_momentum_adj"] * 0.22
+        + x["score_balance_sheet_adj"] * 0.14
+        + x["score_value_adj"] * 0.10
     )
 
-    penalty = np.zeros(len(x), dtype=float)
+    penalty = pd.Series(0.0, index=x.index)
 
-    penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0)
-    penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0)
-    penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0)
-    penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0)
+    if x["debt_to_equity"].notna().any():
+        penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0.0)
+    if x["net_margin"].notna().any():
+        penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0.0)
+    if x["revenue_growth"].notna().any():
+        penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0.0)
+    if x["volatility"].notna().sum() > 5:
+        penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0.0)
 
-    x["tii_score"] = x["tii_score"] - penalty
-    x["tii_score"] = pd.to_numeric(x["tii_score"], errors="coerce").round(2)
+    x["tii_score"] = pd.to_numeric(x["tii_score"] - penalty, errors="coerce").round(2)
+
+    completeness_cols = [
+        "pe", "ps", "ev_ebit", "fcf_yield",
+        "revenue_growth", "eps_growth", "fcf_growth",
+        "gross_margin", "operating_margin", "net_margin", "roic", "roe",
+        "debt_to_equity", "net_debt_ebitda", "current_ratio",
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
+    ]
 
     available = x[completeness_cols].notna().sum(axis=1)
     x["data_confidence"] = ((available / len(completeness_cols)) * 100).round(0)
 
     fallback_mask = x["data_confidence"] < 35
-
     fallback_score = (
         rank_pct(x["return_1m"], ascending=False) * 0.15
         + rank_pct(x["return_3m"], ascending=False) * 0.30
         + rank_pct(x["return_6m"], ascending=False) * 0.30
         + rank_pct(x["return_12m"], ascending=False) * 0.25
     )
-
-    fallback_score = (
-        fallback_score * 0.85
-        + rank_pct(x["volatility"], ascending=True) * 0.15
-    )
+    fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
 
     x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
     x["score_source"] = np.where(fallback_mask, "Price fallback", "Full factor model")
 
+    x["tii_rank"] = x["tii_score"].rank(method="min", ascending=False).astype("Int64")
+
     return x.sort_values("tii_score", ascending=False).reset_index(drop=True)
+
 
 # -----------------------------
 # Top-100 separation
@@ -845,17 +834,13 @@ def compute_tii_scores(df, macro_regime="Neutral"):
 
 def split_top100_and_full_universe(scored_df):
     """
-    Keeps the full universe intact, but creates a clean top-100 view
-    for higher-quality dashboard display and faster mobile rendering.
+    Keep the full universe intact and create a clean top-100 display list.
+    Returns (top_100, full_universe) to match the current dashboard pipeline.
     """
-    full_universe = scored_df.copy()
+    full_universe = scored_df.sort_values("tii_score", ascending=False).reset_index(drop=True).copy()
 
-    # Prefer larger, more liquid names for top display if market_cap exists
     if "market_cap" in full_universe.columns:
-        eligible = full_universe.sort_values(
-            ["tii_score", "market_cap"],
-            ascending=[False, False]
-        )
+        eligible = full_universe.sort_values(["tii_score", "market_cap"], ascending=[False, False])
     else:
         eligible = full_universe.sort_values("tii_score", ascending=False)
 

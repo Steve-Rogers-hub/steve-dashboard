@@ -31,16 +31,16 @@ DEFAULT_SECTOR_CAP = 2
 # =========================
 # GOOGLE SHEETS
 # =========================
-def get_gspread_client():
+def try_get_gspread_client():
+    secret_file_candidates = [
+        "/etc/secrets/google-service-account.json",  # Render
+        "google-service-account.json",               # local repo folder
+    ]
+
+    creds = None
+    credential_source = None
+
     try:
-        secret_file_candidates = [
-            "/etc/secrets/google-service-account.json",  # Render
-            "google-service-account.json",               # local repo folder
-        ]
-
-        creds = None
-        credential_source = None
-
         for candidate in secret_file_candidates:
             if os.path.exists(candidate):
                 creds = Credentials.from_service_account_file(
@@ -53,8 +53,7 @@ def get_gspread_client():
         if creds is None:
             creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
             if not creds_json:
-                st.error("Missing Google credentials.")
-                st.stop()
+                return None, None, "Missing Google credentials."
 
             service_account_info = json.loads(creds_json)
             creds = Credentials.from_service_account_info(
@@ -63,13 +62,19 @@ def get_gspread_client():
             )
             credential_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
 
-        st.caption(f"Credential source: {credential_source}")
-
+        return gspread.authorize(creds), credential_source, None
     except Exception as e:
-        st.error(f"Could not load Google credentials: {e}")
+        return None, None, str(e)
+
+
+def get_gspread_client():
+    client, credential_source, error = try_get_gspread_client()
+    if client is None:
+        st.error(f"Could not load Google credentials: {error}")
         st.stop()
 
-    return gspread.authorize(creds)
+    st.caption(f"Credential source: {credential_source}")
+    return client
 
 
 @st.cache_data(ttl=300)
@@ -168,6 +173,143 @@ def clean_portfolio_dataframe(df):
             df[col] = df[col].fillna("").astype(str).str.strip()
 
     return df
+
+
+def extract_sheet_ticker(value):
+    if pd.isna(value):
+        return ""
+    s = str(value).strip().upper()
+    if ":" in s:
+        s = s.split(":")[-1]
+    return clean_symbol(s)
+
+
+@st.cache_data(ttl=300)
+def load_current_positions_data(sheet_id, worksheet_name, header_row_index):
+    client, credential_source, error = try_get_gspread_client()
+    if client is None:
+        return pd.DataFrame(), f"Google Sheets unavailable: {error}"
+
+    try:
+        sheet = client.open_by_key(sheet_id)
+        worksheet = sheet.worksheet(worksheet_name)
+        data = worksheet.get_all_values()
+    except Exception as e:
+        return pd.DataFrame(), f"Could not load worksheet '{worksheet_name}': {e}"
+
+    if not data or len(data) <= header_row_index:
+        return pd.DataFrame(), f"Worksheet '{worksheet_name}' is empty or missing the expected header row."
+
+    headers = data[header_row_index]
+    rows = data[header_row_index + 1:]
+
+    clean_headers = []
+    seen = {}
+    for i, h in enumerate(headers):
+        col = h.strip() if h else f"Column_{i + 1}"
+        if col in seen:
+            seen[col] += 1
+            col = f"{col}_{seen[col]}"
+        else:
+            seen[col] = 1
+        clean_headers.append(col)
+
+    raw_df = pd.DataFrame(rows, columns=clean_headers)
+    raw_df = raw_df.replace("", pd.NA).dropna(how="all").dropna(axis=1, how="all")
+    df = clean_portfolio_dataframe(raw_df)
+    if df.empty:
+        return pd.DataFrame(), f"Worksheet '{worksheet_name}' contains no usable rows."
+
+    stock_col = find_matching_column(df, ["Stock", "Ticker", "Symbol"])
+    company_col = find_matching_column(df, ["Company Name", "Company", "Name"])
+    status_col = find_matching_column(df, ["Position Status", "Status"])
+    trade_date_col = find_matching_column(df, ["Trade Date", "Date"])
+    quantity_col = find_matching_column(df, ["Quantity"])
+    purchase_price_col = find_matching_column(df, ["Purchase Price", "Buy Price"])
+    market_price_col = find_matching_column(df, ["Market Price", "Latest Market Price", "Current Price"])
+    market_value_col = find_matching_column(df, ["Market Value", "Day Market Value", "Current Market Value"])
+    net_pl_col = find_matching_column(df, ["Net Profit/Loss", "Net P/L"])
+    gain_pct_col = find_matching_column(df, ["% Gain/Loss", "Gain/Loss", "Gain/Loss.2", "Gain/Loss_2"])
+    sold_date_col = find_matching_column(df, ["Sold Date", "Sale Date"])
+
+    if stock_col is None:
+        return pd.DataFrame(), "The portfolio sheet does not contain a Stock/Ticker column."
+
+    x = df.copy()
+    x["ticker"] = x[stock_col].apply(extract_sheet_ticker)
+    x = x[x["ticker"] != ""].copy()
+
+    if status_col is not None:
+        status_text = x[status_col].astype(str).str.strip().str.lower()
+        open_mask = status_text.eq("open")
+    elif sold_date_col is not None:
+        open_mask = x[sold_date_col].astype(str).str.strip().eq("")
+    else:
+        open_mask = pd.Series(True, index=x.index)
+
+    x = x.loc[open_mask].copy()
+    if x.empty:
+        return pd.DataFrame(), f"No open positions were found in '{worksheet_name}'."
+
+    x["company"] = x[company_col].fillna(x["ticker"]) if company_col is not None else x["ticker"]
+    x["position_status"] = x[status_col].fillna("Open") if status_col is not None else "Open"
+
+    def maybe_col(col_name):
+        return x[col_name] if col_name is not None and col_name in x.columns else pd.Series(index=x.index, dtype=object)
+
+    out = pd.DataFrame({
+        "Trade Date": maybe_col(trade_date_col),
+        "ticker": x["ticker"],
+        "company": x["company"],
+        "Position Status": x["position_status"],
+        "Quantity": maybe_col(quantity_col),
+        "Purchase Price": maybe_col(purchase_price_col),
+        "Market Price": maybe_col(market_price_col),
+        "Market Value": maybe_col(market_value_col),
+        "Net Profit/Loss": maybe_col(net_pl_col),
+        "% Gain/Loss": maybe_col(gain_pct_col),
+    })
+
+    for c in ["Quantity", "Purchase Price", "Market Price", "Market Value", "Net Profit/Loss", "% Gain/Loss"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.sort_values(["ticker", "Trade Date"], ascending=[True, True]).reset_index(drop=True)
+    out.attrs["sheet_status"] = f"Loaded live positions from Google Sheets ({worksheet_name}) via {credential_source}."
+    return out, None
+
+
+def enrich_positions_with_dashboard_data(positions_df, full_universe_df, top_100_df):
+    if positions_df.empty:
+        return positions_df
+
+    x = positions_df.copy()
+
+    full_cols = [
+        c for c in [
+            "ticker", "tii_rank", "tii_score", "score_growth", "score_quality",
+            "score_momentum", "score_balance_sheet", "score_value", "data_confidence"
+        ] if c in full_universe_df.columns
+    ]
+    if full_cols:
+        x = x.merge(full_universe_df[full_cols].drop_duplicates(subset=["ticker"]), on="ticker", how="left")
+
+    top_cols = [
+        c for c in ["ticker", "conviction", "model_weight_pct", "ai_recommendation"]
+        if c in top_100_df.columns
+    ]
+    if top_cols:
+        x = x.merge(top_100_df[top_cols].drop_duplicates(subset=["ticker"]), on="ticker", how="left")
+
+    if "conviction" not in x.columns:
+        x["conviction"] = x.apply(classify_conviction, axis=1)
+    else:
+        x["conviction"] = x.apply(
+            lambda row: row["conviction"] if pd.notna(row.get("conviction")) and str(row.get("conviction")).strip() != "" else classify_conviction(row),
+            axis=1,
+        )
+
+    return x
 
 
 # =========================
@@ -700,147 +842,167 @@ def build_macro_overlay(macro_regime="Neutral"):
 
 def compute_tii_scores(df, macro_regime="Neutral"):
     """
-    Robust TII scoring engine used by the dashboard.
-    Returns the full scored universe sorted by descending TII score.
+    Corrected TII engine:
+    - harmonises columns
+    - clips outliers
+    - scores each factor robustly
+    - applies macro overlay
+    - creates a final TII score and rank
     """
     x = standardise_factor_columns(df).copy()
 
     # Fill sector/industry blanks for stability
+    if "sector" not in x.columns:
+        x["sector"] = "Unknown"
+    if "industry" not in x.columns:
+        x["industry"] = "Unknown"
     x["sector"] = x["sector"].replace("", np.nan).fillna("Unknown")
     x["industry"] = x["industry"].replace("", np.nan).fillna("Unknown")
 
+    # Outlier control
     numeric_cols = [
         "market_cap", "price", "pe", "ps", "ev_ebit", "fcf_yield",
         "revenue_growth", "eps_growth", "fcf_growth",
         "gross_margin", "operating_margin", "net_margin", "roic", "roe",
         "debt_to_equity", "net_debt_ebitda", "current_ratio",
-        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility"
     ]
-
-    # Winsorise inputs to limit outlier distortion
     for col in numeric_cols:
-        if col in x.columns:
-            x[col] = clip_series(x[col])
+        if col not in x.columns:
+            x[col] = np.nan
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+        x[col] = clip_series(x[col])
 
-    # Fill missing factor inputs sector-first, then global median
-    factor_input_cols = [
+    # Better missing-data handling
+    for col in [
         "pe", "ps", "ev_ebit", "fcf_yield",
         "revenue_growth", "eps_growth", "fcf_growth",
         "gross_margin", "operating_margin", "net_margin", "roic", "roe",
         "debt_to_equity", "net_debt_ebitda", "current_ratio",
-        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
-    ]
-    for col in factor_input_cols:
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility"
+    ]:
         x[col] = fill_missing_with_median_by_group(x, col, "sector")
 
+    # -------------------------
     # Raw sub-factor scores
+    # -------------------------
+
+    # Value: lower multiples better, higher FCF yield better
     x["score_value"] = (
-        rank_pct(x["pe"], ascending=True) * 0.25
-        + rank_pct(x["ps"], ascending=True) * 0.20
-        + rank_pct(x["ev_ebit"], ascending=True) * 0.25
-        + rank_pct(x["fcf_yield"], ascending=False) * 0.30
+        rank_pct(x["pe"], ascending=True) * 0.25 +
+        rank_pct(x["ps"], ascending=True) * 0.20 +
+        rank_pct(x["ev_ebit"], ascending=True) * 0.25 +
+        rank_pct(x["fcf_yield"], ascending=False) * 0.30
     )
 
+    # Growth: higher is better
     x["score_growth"] = (
-        rank_pct(x["revenue_growth"], ascending=False) * 0.40
-        + rank_pct(x["eps_growth"], ascending=False) * 0.35
-        + rank_pct(x["fcf_growth"], ascending=False) * 0.25
+        rank_pct(x["revenue_growth"], ascending=False) * 0.40 +
+        rank_pct(x["eps_growth"], ascending=False) * 0.35 +
+        rank_pct(x["fcf_growth"], ascending=False) * 0.25
     )
 
+    # Quality: higher margins and returns better
     x["score_quality"] = (
-        rank_pct(x["gross_margin"], ascending=False) * 0.15
-        + rank_pct(x["operating_margin"], ascending=False) * 0.25
-        + rank_pct(x["net_margin"], ascending=False) * 0.15
-        + rank_pct(x["roic"], ascending=False) * 0.25
-        + rank_pct(x["roe"], ascending=False) * 0.20
+        rank_pct(x["gross_margin"], ascending=False) * 0.15 +
+        rank_pct(x["operating_margin"], ascending=False) * 0.25 +
+        rank_pct(x["net_margin"], ascending=False) * 0.15 +
+        rank_pct(x["roic"], ascending=False) * 0.25 +
+        rank_pct(x["roe"], ascending=False) * 0.20
     )
 
+    # Balance sheet: less leverage and stronger liquidity better
     x["score_balance_sheet"] = (
-        rank_pct(x["debt_to_equity"], ascending=True) * 0.40
-        + rank_pct(x["net_debt_ebitda"], ascending=True) * 0.35
-        + rank_pct(x["current_ratio"], ascending=False) * 0.25
+        rank_pct(x["debt_to_equity"], ascending=True) * 0.40 +
+        rank_pct(x["net_debt_ebitda"], ascending=True) * 0.35 +
+        rank_pct(x["current_ratio"], ascending=False) * 0.25
     )
 
+    # Momentum: medium-term stronger, but penalise excessive volatility
     x["score_momentum_raw"] = (
-        rank_pct(x["return_1m"], ascending=False) * 0.10
-        + rank_pct(x["return_3m"], ascending=False) * 0.25
-        + rank_pct(x["return_6m"], ascending=False) * 0.30
-        + rank_pct(x["return_12m"], ascending=False) * 0.35
+        rank_pct(x["return_1m"], ascending=False) * 0.10 +
+        rank_pct(x["return_3m"], ascending=False) * 0.25 +
+        rank_pct(x["return_6m"], ascending=False) * 0.30 +
+        rank_pct(x["return_12m"], ascending=False) * 0.35
     )
     x["score_low_vol"] = rank_pct(x["volatility"], ascending=True)
     x["score_momentum"] = x["score_momentum_raw"] * 0.85 + x["score_low_vol"] * 0.15
 
+    # -------------------------
     # Macro overlay
+    # -------------------------
     overlay = build_macro_overlay(macro_regime)
+
     x["score_value_adj"] = x["score_value"] * overlay["value"]
     x["score_growth_adj"] = x["score_growth"] * overlay["growth"]
     x["score_quality_adj"] = x["score_quality"] * overlay["quality"]
     x["score_balance_sheet_adj"] = x["score_balance_sheet"] * overlay["balance_sheet"]
     x["score_momentum_adj"] = x["score_momentum"] * overlay["momentum"]
 
-    # Final TII score
+    # -------------------------
+    # Final TII score (factor model)
+    # -------------------------
     x["tii_score"] = (
-        x["score_quality_adj"] * 0.28
-        + x["score_growth_adj"] * 0.26
-        + x["score_momentum_adj"] * 0.22
-        + x["score_balance_sheet_adj"] * 0.14
-        + x["score_value_adj"] * 0.10
+        x["score_quality_adj"] * 0.28 +
+        x["score_growth_adj"] * 0.26 +
+        x["score_momentum_adj"] * 0.22 +
+        x["score_balance_sheet_adj"] * 0.14 +
+        x["score_value_adj"] * 0.10
     )
 
-    penalty = pd.Series(0.0, index=x.index)
+    penalty = np.zeros(len(x), dtype=float)
+    penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0)
+    penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0)
+    penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0)
+    penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0)
 
-    if x["debt_to_equity"].notna().any():
-        penalty += np.where(x["debt_to_equity"] > x["debt_to_equity"].median(), 1.5, 0.0)
-    if x["net_margin"].notna().any():
-        penalty += np.where(x["net_margin"] < x["net_margin"].median(), 1.0, 0.0)
-    if x["revenue_growth"].notna().any():
-        penalty += np.where(x["revenue_growth"] < x["revenue_growth"].median(), 1.0, 0.0)
-    if x["volatility"].notna().sum() > 5:
-        penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0.0)
-
-    x["tii_score"] = pd.to_numeric(x["tii_score"] - penalty, errors="coerce").round(2)
+    x["tii_score"] = x["tii_score"] - penalty
+    x["tii_score"] = pd.to_numeric(x["tii_score"], errors="coerce").round(2)
 
     completeness_cols = [
         "pe", "ps", "ev_ebit", "fcf_yield",
         "revenue_growth", "eps_growth", "fcf_growth",
         "gross_margin", "operating_margin", "net_margin", "roic", "roe",
         "debt_to_equity", "net_debt_ebitda", "current_ratio",
-        "return_1m", "return_3m", "return_6m", "return_12m", "volatility",
+        "return_1m", "return_3m", "return_6m", "return_12m", "volatility"
     ]
-
     available = x[completeness_cols].notna().sum(axis=1)
     x["data_confidence"] = ((available / len(completeness_cols)) * 100).round(0)
 
     fallback_mask = x["data_confidence"] < 35
     fallback_score = (
-        rank_pct(x["return_1m"], ascending=False) * 0.15
-        + rank_pct(x["return_3m"], ascending=False) * 0.30
-        + rank_pct(x["return_6m"], ascending=False) * 0.30
-        + rank_pct(x["return_12m"], ascending=False) * 0.25
+        rank_pct(x["return_1m"], ascending=False) * 0.15 +
+        rank_pct(x["return_3m"], ascending=False) * 0.30 +
+        rank_pct(x["return_6m"], ascending=False) * 0.30 +
+        rank_pct(x["return_12m"], ascending=False) * 0.25
     )
-    fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
+    fallback_score = (
+        fallback_score * 0.85 +
+        rank_pct(x["volatility"], ascending=True) * 0.15
+    )
 
     x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
     x["score_source"] = np.where(fallback_mask, "Price fallback", "Full factor model")
 
-    x["tii_rank"] = x["tii_score"].rank(method="min", ascending=False).astype("Int64")
+    ranked = x["tii_score"].rank(method="min", ascending=False)
+    x["tii_rank"] = ranked.astype("Int64")
 
     return x.sort_values("tii_score", ascending=False).reset_index(drop=True)
 
 
-# -----------------------------
-# Top-100 separation
-# -----------------------------
-
 def split_top100_and_full_universe(scored_df):
     """
-    Keep the full universe intact and create a clean top-100 display list.
-    Returns (top_100, full_universe) to match the current dashboard pipeline.
+    Keeps the full universe intact, but creates a clean top-100 view
+    for higher-quality dashboard display and faster mobile rendering.
     """
-    full_universe = scored_df.sort_values("tii_score", ascending=False).reset_index(drop=True).copy()
+    full_universe = scored_df.copy()
 
+    # Prefer larger, more liquid names for top display if market_cap exists
     if "market_cap" in full_universe.columns:
-        eligible = full_universe.sort_values(["tii_score", "market_cap"], ascending=[False, False])
+        eligible = full_universe.sort_values(
+            ["tii_score", "market_cap"],
+            ascending=[False, False]
+        )
     else:
         eligible = full_universe.sort_values("tii_score", ascending=False)
 
@@ -1192,8 +1354,18 @@ def build_dashboard_data(macro_regime):
     )
 
     top_100_df = add_conviction_to_top100(top_100_df)
+    current_positions_df, sheet_error = load_current_positions_data(
+        SHEET_ID,
+        WORKSHEET_NAME,
+        HEADER_ROW_INDEX,
+    )
+    current_positions_df = enrich_positions_with_dashboard_data(
+        current_positions_df,
+        full_universe_df,
+        top_100_df,
+    )
 
-    return universe_df, full_universe_df, top_100_df, portfolio_model_df
+    return universe_df, full_universe_df, top_100_df, portfolio_model_df, current_positions_df, sheet_error
 
 
 # ---------------------------------------------------------
@@ -1219,7 +1391,7 @@ st.sidebar.caption("Top 100 drives the main dashboard. Full universe remains ava
 # ---------------------------------------------------------
 
 try:
-    raw_universe_df, full_universe_df, top_100_df, portfolio_model_df = build_dashboard_data(macro_regime)
+    raw_universe_df, full_universe_df, top_100_df, portfolio_model_df, current_positions_df, sheet_error = build_dashboard_data(macro_regime)
 except Exception as e:
     st.error("Dashboard data could not be built.")
     st.exception(e)
@@ -1261,11 +1433,15 @@ metric_card_row(top_100_df, full_universe_df)
 # Downloads
 # ---------------------------------------------------------
 
-download_bytes = to_excel_bytes({
+download_sheets = {
     "Top 100": format_display_table(top_100_df),
     "Portfolio Model": format_display_table(portfolio_model_df),
     "Full Universe": format_display_table(full_universe_df),
-})
+}
+if not current_positions_df.empty:
+    download_sheets["Current Portfolio"] = format_display_table(current_positions_df)
+
+download_bytes = to_excel_bytes(download_sheets)
 
 c_dl1, c_dl2 = st.columns([1, 3])
 with c_dl1:
@@ -1278,7 +1454,7 @@ with c_dl1:
     )
 
 with c_dl2:
-    st.caption("Workbook includes Top 100, Portfolio Model, and Full Universe sheets.")
+    st.caption("Workbook includes Top 100, Portfolio Model, Full Universe, and Current Portfolio sheets when available.")
 
 # ---------------------------------------------------------
 # Main tabs
@@ -1347,6 +1523,53 @@ with tab1:
 
 with tab2:
     st.subheader("Portfolio Model")
+
+    st.markdown("**Current Portfolio (live Google Sheet)**")
+    if sheet_error:
+        st.info(sheet_error)
+    elif current_positions_df.empty:
+        st.info("No open positions were returned from the Google Sheet.")
+    else:
+        positions_df = current_positions_df.copy()
+        if selected_sector != "All" and "sector" in positions_df.columns:
+            positions_df = positions_df[positions_df["sector"] == selected_sector].copy()
+
+        h1, h2, h3, h4 = st.columns(4)
+        with h1:
+            st.metric("Open positions", f"{len(positions_df):,}")
+        with h2:
+            mv = pd.to_numeric(positions_df.get("Market Value"), errors="coerce").sum()
+            st.metric("Market value", f"${mv:,.0f}" if pd.notna(mv) else "N/A")
+        with h3:
+            pnl = pd.to_numeric(positions_df.get("Net Profit/Loss"), errors="coerce").sum()
+            st.metric("Net P/L", f"${pnl:,.0f}" if pd.notna(pnl) else "N/A")
+        with h4:
+            avg_tii = pd.to_numeric(positions_df.get("tii_score"), errors="coerce").mean()
+            st.metric("Avg holding TII", f"{avg_tii:.1f}" if pd.notna(avg_tii) else "N/A")
+
+        positions_columns_desktop = [
+            "Trade Date", "ticker", "company", "Position Status", "Quantity",
+            "Purchase Price", "Market Price", "Market Value", "Net Profit/Loss",
+            "% Gain/Loss", "tii_rank", "tii_score", "conviction", "model_weight_pct",
+            "score_growth", "score_quality", "score_momentum", "score_balance_sheet",
+            "score_value", "ai_recommendation"
+        ]
+        positions_columns_mobile = [
+            "ticker", "Market Value", "Net Profit/Loss", "tii_score", "conviction"
+        ]
+
+        if mobile_mode:
+            simple_mobile_table(positions_df, positions_columns_mobile)
+        else:
+            st.dataframe(
+                format_display_table(positions_df[[c for c in positions_columns_desktop if c in positions_df.columns]]),
+                use_container_width=True,
+                height=320,
+                hide_index=True,
+            )
+
+    st.markdown("---")
+    st.markdown("**Model Portfolio**")
 
     pm_df = portfolio_model_df.copy()
     if selected_sector != "All" and "sector" in pm_df.columns:

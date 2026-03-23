@@ -6,3 +6,4 @@ venv/
 .streamlit/
 test_sheet.py
 *.csv
+!weekly_scan_output.csv

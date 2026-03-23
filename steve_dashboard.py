@@ -796,6 +796,7 @@ def compute_tii_scores(df, macro_regime="Neutral"):
     x = df.copy()
 
     # ----------------------------
+    # ----------------------------
     # Final TII score (factor model)
     # ----------------------------
     x["tii_score"] = (
@@ -814,7 +815,6 @@ def compute_tii_scores(df, macro_regime="Neutral"):
     penalty += np.where(x["volatility"] > x["volatility"].quantile(0.90), 2.0, 0)
 
     x["tii_score"] = x["tii_score"] - penalty
-
     x["tii_score"] = pd.to_numeric(x["tii_score"], errors="coerce").round(2)
 
     available = x[completeness_cols].notna().sum(axis=1)
@@ -823,35 +823,22 @@ def compute_tii_scores(df, macro_regime="Neutral"):
     fallback_mask = x["data_confidence"] < 35
 
     fallback_score = (
-        rank_pct(x["return_1m"], ascending=False) * 0.15 +
-        rank_pct(x["return_3m"], ascending=False) * 0.30 +
-        rank_pct(x["return_6m"], ascending=False) * 0.30 +
-        rank_pct(x["return_12m"], ascending=False) * 0.25
+        rank_pct(x["return_1m"], ascending=False) * 0.15
+        + rank_pct(x["return_3m"], ascending=False) * 0.30
+        + rank_pct(x["return_6m"], ascending=False) * 0.30
+        + rank_pct(x["return_12m"], ascending=False) * 0.25
     )
 
-    fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
+    fallback_score = (
+        fallback_score * 0.85
+        + rank_pct(x["volatility"], ascending=True) * 0.15
+    )
 
     x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
-
     x["score_source"] = np.where(fallback_mask, "Price fallback", "Full factor model")
 
     return x.sort_values("tii_score", ascending=False).reset_index(drop=True)
 
-# Fallback when fundamental coverage is too sparse:
-# use price-based scoring so the dashboard still works.
-fallback_mask = x["data_confidence"] < 35
-
-fallback_score = (
-    rank_pct(x["return_1m"], ascending=False) * 0.15 +
-    rank_pct(x["return_3m"], ascending=False) * 0.30 +
-    rank_pct(x["return_6m"], ascending=False) * 0.30 +
-    rank_pct(x["return_12m"], ascending=False) * 0.25
-)
-
-# modest volatility penalty
-fallback_score = fallback_score * 0.85 + rank_pct(x["volatility"], ascending=True) * 0.15
-
-x.loc[fallback_mask, "tii_score"] = fallback_score.loc[fallback_mask]
 # -----------------------------
 # Top-100 separation
 # -----------------------------

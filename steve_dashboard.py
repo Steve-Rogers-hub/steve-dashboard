@@ -31,7 +31,7 @@ DEFAULT_PORTFOLIO_SIZE = 10
 DEFAULT_SECTOR_CAP = 2
 
 # Dashboard modes
-MODE_PURE_TII = "Pure TII (Richard's System)"
+MODE_PURE_TII = "Pure TII"
 MODE_ENHANCED = "Enhanced (Factor Model)"
 
 
@@ -675,7 +675,7 @@ def build_signal_summary(row):
 
 def build_pure_tii_view(universe_df):
     """
-    Pure Richard Lie TII mode.
+    Pure TII mode.
     Returns: full_universe, signals_df, portfolio_df
     - full_universe: all stocks ranked by scan_tii
     - signals_df:   qualified stocks only (scan_qualifies=True), sorted by TII
@@ -1397,7 +1397,7 @@ dashboard_mode = st.sidebar.radio(
     help=(
         f"**{MODE_PURE_TII}**: ranks by the TII score (-10 to +10) computed by the weekly scan. "
         f"Only qualified signals (TII ≥ 4 + entry trigger) appear in the signals list. "
-        f"No fundamental overlay. This is Richard's original system.\n\n"
+        f"No fundamental overlay.\n\n"
         f"**{MODE_ENHANCED}**: adds a five-factor fundamental model (quality, growth, momentum, "
         f"balance sheet, value) on top of the scan universe."
     ),
@@ -1967,7 +1967,7 @@ with st.expander("System Notes"):
     if dashboard_mode == MODE_PURE_TII:
         st.markdown(
             """
-            **Pure TII Mode** — Richard Lie's original Stockradar system.
+            **Pure TII Mode** — the original Stockradar system.
 
             - Signals are stocks that score **TII ≥ 4** AND have an active entry trigger (New High or Trend Reversal).
             - TII is computed by the weekly scan script from four components: Price trend (±3), Volume (±2), Moving Average (±2), MACD (±3).

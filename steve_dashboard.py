@@ -467,66 +467,52 @@ def fetch_symbol_metadata(symbols):
     """
     Fetch sector, market cap and short name from yfinance.
 
-    Uses small batches, short pauses, and a single-symbol fallback path to
-    reduce throttling on hosted environments such as Render.
+    Fixes vs original:
+      - Uses yf.Tickers() batch calls (one HTTP round-trip per batch of 20)
+        instead of one call per ticker, which was being rate-limited on Render.
+      - Adds a short sleep between batches to stay under rate limits.
+      - Falls back to individual ticker calls for any batch that fails.
+      - Caps at 500 symbols to keep startup time reasonable.
     """
     import time
 
-    def _extract_info(info):
-        info = info or {}
-        return {
-            "sector": info.get("sector") or "",
-            "market_cap": info.get("marketCap"),
-            "short_name": info.get("shortName") or info.get("longName") or "",
-        }
-
-    symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
-    symbols = list(dict.fromkeys(symbols))
-
     meta = {}
+    symbols = list(symbols)[:500]
     batch_size = 20
-    pause_seconds = 0.6
-    batch_retries = 2
 
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i : i + batch_size]
-        batch_loaded = False
-
-        for attempt in range(batch_retries):
-            try:
-                tickers_obj = yf.Tickers(" ".join(batch))
-                batch_meta = {}
-
-                for sym in batch:
-                    ticker_obj = tickers_obj.tickers.get(sym)
-                    if ticker_obj is None:
-                        batch_meta[sym] = {"sector": "", "market_cap": np.nan, "short_name": ""}
-                        continue
-
-                    try:
-                        batch_meta[sym] = _extract_info(ticker_obj.info)
-                    except Exception:
-                        batch_meta[sym] = {"sector": "", "market_cap": np.nan, "short_name": ""}
-
-                meta.update(batch_meta)
-                batch_loaded = True
-                break
-            except Exception:
-                if attempt < batch_retries - 1:
-                    time.sleep(pause_seconds)
-
-        if not batch_loaded:
+        try:
+            tickers_obj = yf.Tickers(" ".join(batch))
             for sym in batch:
                 try:
-                    meta[sym] = _extract_info(yf.Ticker(sym).info)
+                    info = tickers_obj.tickers[sym].info or {}
+                    meta[sym] = {
+                        "sector":     info.get("sector")    or "",
+                        "market_cap": info.get("marketCap"),
+                        "short_name": info.get("shortName") or info.get("longName") or "",
+                    }
                 except Exception:
                     meta[sym] = {"sector": "", "market_cap": np.nan, "short_name": ""}
-                time.sleep(0.15)
+        except Exception:
+            # Batch failed — fall back to individual calls for this batch
+            for sym in batch:
+                try:
+                    info = yf.Ticker(sym).info or {}
+                    meta[sym] = {
+                        "sector":     info.get("sector")    or "",
+                        "market_cap": info.get("marketCap"),
+                        "short_name": info.get("shortName") or info.get("longName") or "",
+                    }
+                except Exception:
+                    meta[sym] = {"sector": "", "market_cap": np.nan, "short_name": ""}
 
-        if i + batch_size < len(symbols):
-            time.sleep(pause_seconds)
+        # Polite pause between batches — avoids 429s on Render's shared IP
+        time.sleep(0.5)
 
     return meta
+
+
 # =========================
 # SHARED MARKET HELPERS
 # =========================
@@ -611,10 +597,10 @@ def load_master_universe():
     universe = universe[universe["ticker"] != ""].copy()
 
     company_col = find_matching_column(universe, ["company", "name", "short_name", "long_name", "stock"])
-    if company_col is not None and company_col != symbol_col and "company" not in universe.columns:
+    if company_col is not None and "company" not in universe.columns:
         universe["company"] = universe[company_col].astype(str).str.strip()
     elif "company" not in universe.columns:
-        universe["company"] = ""
+        universe["company"] = universe["ticker"]
 
     symbols = universe["ticker"].dropna().astype(str).unique().tolist()
 
@@ -633,8 +619,27 @@ def load_master_universe():
         })
     meta_df = pd.DataFrame(meta_rows)
 
-    universe = universe.merge(history_df, on="ticker", how="left")
+    # Backfill momentum/history features without creating duplicate *_x/*_y columns.
+    # This matters when the upstream scan CSV already contains momentum fields.
+    history_cols = ["price", "return_1m", "return_3m", "return_6m", "return_12m", "volatility"]
+
+    for col in history_cols:
+        if col not in universe.columns:
+            universe[col] = np.nan
+
+    universe = universe.merge(history_df, on="ticker", how="left", suffixes=("", "_hist"))
     universe = universe.merge(meta_df, on="ticker", how="left")
+
+    for col in history_cols:
+        hist_col = f"{col}_hist"
+        if hist_col in universe.columns:
+            universe[col] = pd.to_numeric(universe[col], errors="coerce")
+            universe[hist_col] = pd.to_numeric(universe[hist_col], errors="coerce")
+            universe[col] = universe[col].fillna(universe[hist_col])
+
+    drop_hist_cols = [f"{c}_hist" for c in history_cols if f"{c}_hist" in universe.columns]
+    if drop_hist_cols:
+        universe = universe.drop(columns=drop_hist_cols)
 
     if "sector" not in universe.columns:
         universe["sector"] = universe.get("sector_meta", "")
@@ -648,13 +653,11 @@ def load_master_universe():
         universe["market_cap"] = pd.to_numeric(universe["market_cap"], errors="coerce")
         universe["market_cap"] = universe["market_cap"].fillna(universe["market_cap_meta"])
 
-    company_series = universe["company"].astype(str).str.strip()
-    blank_company = company_series.isin(["", "nan", "None"])
-    ticker_like_company = company_series.str.upper() == universe["ticker"].astype(str).str.upper()
+    blank_company = universe["company"].astype(str).str.strip().isin(["", "nan", "None"])
+    ticker_like_company = universe["company"].astype(str).str.strip().str.upper() == universe["ticker"].astype(str).str.strip().str.upper()
     company_needs_backfill = blank_company | ticker_like_company
     universe.loc[company_needs_backfill, "company"] = (
         universe.loc[company_needs_backfill, "short_name_meta"]
-        .replace("", np.nan)
         .fillna(universe.loc[company_needs_backfill, "ticker"])
     )
 
@@ -1099,18 +1102,12 @@ def classify_conviction(row):
     return label
 
 
-def normalise_conviction_label(conviction):
-    """Strip display suffixes such as '(Momentum)' from conviction labels."""
-    conviction = str(conviction or "").strip()
-    return conviction.replace(" (Momentum)", "")
-
-
 def recommended_position_size(row):
     """
     Basic portfolio sizing helper.
     This is not execution advice. It just maps conviction to a model weight.
     """
-    conviction = normalise_conviction_label(classify_conviction(row))
+    conviction = classify_conviction(row)
 
     if conviction == "High Conviction":
         return 0.050   # 5.0%
@@ -1323,8 +1320,7 @@ def metric_card_row(top_100_df, full_universe_df):
     with c4:
         hc_count = 0
         if "conviction" in top_100_df.columns:
-            conviction_labels = top_100_df["conviction"].astype(str).apply(normalise_conviction_label)
-            hc_count = (conviction_labels == "High Conviction").sum()
+            hc_count = (top_100_df["conviction"] == "High Conviction").sum()
         st.metric("High Conviction", f"{hc_count:,}")
 
 
@@ -1747,6 +1743,19 @@ with tab4:
                 hide_index=True,
             )
 
+# ---------------------------------------------------------
+# Footer notes
+# ---------------------------------------------------------
+
+with st.expander("System Notes"):
+    st.markdown(
+        """
+        - Main dashboard view is based on the **Top 100** ranked names.
+        - The **Full Universe** remains intact for deeper review and download.
+        - Macro regime affects factor tilts through the Chunk 2 overlay.
+        - Portfolio model weights are **model outputs**, not execution instructions.
+        """
+    )
 # =========================================================
 # CHUNK 4 — AI INSIGHTS, PORTFOLIO ACTIONS, CRASH OVERLAY,
 #            AND FINAL APP WIRING
@@ -2248,17 +2257,13 @@ with tab6:
 # Replace the earlier workbook export block in Chunk 3 with this one
 # if you want the new tabs included in the export.
 
-download_sheets = {
+download_bytes = to_excel_bytes({
     "Top 100": format_display_table(top_100_df),
     "Portfolio Model": format_display_table(portfolio_model_df),
     "Actions": format_display_table(top_100_actions_df),
     "Macro Monitor": crash_signal_df,
     "Full Universe": format_display_table(full_universe_df),
-}
-if not current_positions_df.empty:
-    download_sheets["Current Portfolio"] = format_display_table(current_positions_df)
-
-download_bytes = to_excel_bytes(download_sheets)
+})
 
 st.download_button(
     "Download full workbook",

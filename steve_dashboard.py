@@ -1743,19 +1743,6 @@ with tab4:
                 hide_index=True,
             )
 
-# ---------------------------------------------------------
-# Footer notes
-# ---------------------------------------------------------
-
-with st.expander("System Notes"):
-    st.markdown(
-        """
-        - Main dashboard view is based on the **Top 100** ranked names.
-        - The **Full Universe** remains intact for deeper review and download.
-        - Macro regime affects factor tilts through the Chunk 2 overlay.
-        - Portfolio model weights are **model outputs**, not execution instructions.
-        """
-    )
 # =========================================================
 # CHUNK 4 — AI INSIGHTS, PORTFOLIO ACTIONS, CRASH OVERLAY,
 #            AND FINAL APP WIRING

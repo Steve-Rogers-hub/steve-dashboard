@@ -556,6 +556,11 @@ def load_master_universe():
         universe["company"] = universe[company_col].astype(str).str.strip()
     elif "company" not in universe.columns:
         universe["company"] = universe["ticker"]
+    else:
+        # Column exists in CSV but may be all-NaN (momentum-only scan output).
+        # Force object dtype so later string backfill at "company_needs_backfill"
+        # block doesn't hit a float64-vs-str TypeError.
+        universe["company"] = universe["company"].astype(object)
 
     symbols = universe["ticker"].dropna().astype(str).unique().tolist()
 
